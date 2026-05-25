@@ -1,0 +1,358 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/windows-installer.yml"
+      - "cairn/**"
+      - "electron/**"
+      - "scripts/**"
+      - "package.json"
+      - "package-lock.json"
+      - "dispatch.yaml"
+      - "dispatch_mock.yaml"
+  pull_request:
+    paths:
+      - ".github/workflows/windows-installer.yml"
+      - "cairn/**"
+      - "electron/**"
+      - "scripts/**"
+      - "package.json"
+      - "package-lock.json"
+      - "dispatch.yaml"
+      - "dispatch_mock.yaml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-smoke-test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CAIRN_WINDOWS_LOG_DIR: cairn-windows-installer-logs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Electron dependencies
+        run: npm ci
+
+      - name: Prepare diagnostic directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CAIRN_WINDOWS_LOG_DIR | Out-Null
+          "Run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
+            Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "run-context.log") -Encoding utf8
+          "Workspace: $PWD" |
+            Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "run-context.log") -Encoding utf8 -Append
+          Get-ComputerInfo |
+            Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "runner-computer-info.log") -Encoding utf8
+
+      - name: Run Electron unit tests
+        run: npm run test:electron
+
+      - name: Build Windows backend executable
+        shell: pwsh
+        run: |
+          npm run package:backend *>&1 |
+            Tee-Object -FilePath (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "package-backend.log")
+          if ($LASTEXITCODE -ne 0) {
+            throw "package:backend failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Verify backend executable
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "backend-smoke.log"
+          $backend = Join-Path $PWD "build/backend/cairn-server.exe"
+          "Backend executable: $backend" | Out-File $log -Encoding utf8
+          if (!(Test-Path $backend)) {
+            throw "Expected backend executable is missing: $backend"
+          }
+
+          $signature = [System.IO.File]::ReadAllBytes($backend)[0..1]
+          if ($signature[0] -ne 0x4d -or $signature[1] -ne 0x5a) {
+            throw "Backend executable is not a Windows PE/MZ executable: $backend"
+          }
+          "Backend PE/MZ signature verified." | Out-File $log -Encoding utf8 -Append
+
+          $backendStdout = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "backend-smoke-stdout.log"
+          $backendStderr = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "backend-smoke-stderr.log"
+          $proc = Start-Process -FilePath $backend -ArgumentList @(
+            "serve",
+            "--host", "127.0.0.1",
+            "--port", "53111",
+            "--db-path", (Join-Path $env:RUNNER_TEMP "cairn-backend-smoke.db"),
+            "--no-access-log"
+          ) -RedirectStandardOutput $backendStdout -RedirectStandardError $backendStderr -PassThru -WindowStyle Hidden
+
+          try {
+            $ready = $false
+            foreach ($attempt in 1..120) {
+              try {
+                $response = Invoke-WebRequest "http://127.0.0.1:53111/openapi.json" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -lt 500) {
+                  "Backend ready after attempt $attempt with status $($response.StatusCode)." |
+                    Out-File $log -Encoding utf8 -Append
+                  $ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+
+            if (!$ready) {
+              throw "Windows backend executable did not become ready"
+            }
+          } finally {
+            "Backend process exited: $($proc.HasExited)" | Out-File $log -Encoding utf8 -Append
+            if (!$proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+            }
+          }
+
+      - name: Build Windows NSIS installer
+        shell: pwsh
+        run: |
+          npx electron-builder --win nsis --x64 --publish never *>&1 |
+            Tee-Object -FilePath (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "electron-builder-nsis.log")
+          if ($LASTEXITCODE -ne 0) {
+            throw "electron-builder NSIS failed with exit code $LASTEXITCODE"
+          }
+          Get-ChildItem "dist" -Recurse |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize |
+            Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "dist-tree.log") -Encoding utf8
+
+      - name: Verify packaged backend resource
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "packaged-resource-check.log"
+          $backend = Join-Path $PWD "dist/win-unpacked/resources/backend/cairn-server.exe"
+          "Packaged backend executable: $backend" | Out-File $log -Encoding utf8
+          if (!(Test-Path $backend)) {
+            throw "Expected packaged backend executable is missing: $backend"
+          }
+
+          $signature = [System.IO.File]::ReadAllBytes($backend)[0..1]
+          if ($signature[0] -ne 0x4d -or $signature[1] -ne 0x5a) {
+            throw "Packaged backend is not a Windows PE/MZ executable: $backend"
+          }
+          "Packaged backend PE/MZ signature verified." | Out-File $log -Encoding utf8 -Append
+
+          $installer = Get-ChildItem "dist" -Filter "*.exe" |
+            Where-Object { $_.Name -like "*Setup*" } |
+            Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "NSIS installer was not generated"
+          }
+          "NSIS installer: $($installer.FullName) ($($installer.Length) bytes)" |
+            Out-File $log -Encoding utf8 -Append
+
+      - name: Install app and verify Electron startup
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "dist" -Filter "*.exe" |
+            Where-Object { $_.Name -like "*Setup*" } |
+            Select-Object -First 1
+          $installDir = Join-Path $env:RUNNER_TEMP "CairnInstall"
+          $appExe = Join-Path $installDir "Cairn.exe"
+          $diagLog = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "install-startup-check.log"
+          $stdoutLog = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "cairn-electron-stdout.log"
+          $stderrLog = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "cairn-electron-stderr.log"
+          $startupLog = Join-Path $env:CAIRN_WINDOWS_LOG_DIR "cairn-electron-startup.log"
+
+          "Installer: $($installer.FullName)" | Out-File $diagLog -Encoding utf8
+          "Requested install dir: $installDir" | Out-File $diagLog -Encoding utf8 -Append
+
+          if (Test-Path $installDir) {
+            Remove-Item $installDir -Recurse -Force
+          }
+
+          $installerProc = Start-Process -FilePath $installer.FullName -ArgumentList @("/S", "/currentuser", "/D=$installDir") -Wait -PassThru
+          "Installer process exited with code $($installerProc.ExitCode)." | Out-File $diagLog -Encoding utf8 -Append
+          if ($installerProc.ExitCode -ne 0) {
+            throw "NSIS silent installer failed with exit code $($installerProc.ExitCode)"
+          }
+
+          "Installer finished. Checking app executable: $appExe" | Out-File $diagLog -Encoding utf8 -Append
+          foreach ($attempt in 1..60) {
+            if (Test-Path $appExe) {
+              break
+            }
+
+            $searchRoots = @(
+              $installDir,
+              (Join-Path $env:LOCALAPPDATA "Programs"),
+              $env:ProgramFiles,
+              ${env:ProgramFiles(x86)}
+            ) | Where-Object { $_ -and (Test-Path $_) }
+
+            $fallbacks = foreach ($root in $searchRoots) {
+              Get-ChildItem $root -Filter "Cairn.exe" -Recurse -Depth 5 -ErrorAction SilentlyContinue
+            }
+
+            if ($fallbacks.Count -gt 0) {
+              $appExe = $fallbacks[0].FullName
+              Write-Host "Using discovered app executable: $appExe"
+              "Using discovered app executable after attempt ${attempt}: $appExe" |
+                Out-File $diagLog -Encoding utf8 -Append
+              break
+            }
+
+            "App executable not found after install attempt $attempt; retrying." |
+              Out-File $diagLog -Encoding utf8 -Append
+            Start-Sleep -Seconds 1
+          }
+
+          if (!(Test-Path $appExe)) {
+            Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue |
+              Select-Object FullName |
+              Format-Table -AutoSize |
+              Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "requested-install-dir-tree.log") -Encoding utf8
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+              Select-Object FullName |
+              Format-Table -AutoSize |
+              Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "local-programs-tree.log") -Encoding utf8
+            "App executable was not found after silent install." |
+              Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "startup-error.log") -Encoding utf8
+            throw "Installed app executable is missing: $appExe"
+          }
+
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $env:CAIRN_ELECTRON_STARTUP_LOG = $startupLog
+          $proc = Start-Process `
+            -FilePath $appExe `
+            -ArgumentList "--remote-debugging-port=9340" `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -PassThru
+          "Started Electron PID: $($proc.Id)" | Out-File $diagLog -Encoding utf8 -Append
+          try {
+            $window = $null
+            foreach ($attempt in 1..120) {
+              if ($proc.HasExited) {
+                "Electron exited early with code $($proc.ExitCode)." | Out-File $diagLog -Encoding utf8 -Append
+                throw "Installed Electron app exited early with code $($proc.ExitCode)"
+              }
+
+              try {
+                $pages = Invoke-RestMethod "http://127.0.0.1:9340/json/list" -TimeoutSec 2
+                $pages |
+                  ConvertTo-Json -Depth 5 |
+                  Out-File (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "devtools-pages-latest.json") -Encoding utf8
+                $window = $pages | Where-Object {
+                  $_.type -eq "page" -and $_.title -eq "Cairn" -and $_.url -match "^http://127\.0\.0\.1:\d+"
+                } | Select-Object -First 1
+                if ($null -ne $window) {
+                  "Found Cairn window after attempt $attempt at $($window.url)." |
+                    Out-File $diagLog -Encoding utf8 -Append
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+
+            if ($null -eq $window) {
+              try {
+                Invoke-RestMethod "http://127.0.0.1:9340/json/list" -TimeoutSec 2 |
+                  ConvertTo-Json -Depth 5 |
+                  Tee-Object -FilePath (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "devtools-pages-final.json")
+              } catch {
+                "DevTools endpoint was not reachable: $($_.Exception.Message)" |
+                  Tee-Object -FilePath (Join-Path $env:CAIRN_WINDOWS_LOG_DIR "startup-error.log")
+              }
+              throw "Installed Electron app did not load the local Cairn backend UI"
+            }
+
+            $backendUrl = [System.Uri]$window.url
+            $openApi = "{0}://{1}:{2}/openapi.json" -f $backendUrl.Scheme, $backendUrl.Host, $backendUrl.Port
+            $response = Invoke-WebRequest $openApi -UseBasicParsing -TimeoutSec 5
+            if ($response.StatusCode -ge 500) {
+              throw "Installed app backend returned status $($response.StatusCode)"
+            }
+            "Installed backend OpenAPI check passed with status $($response.StatusCode): $openApi" |
+              Out-File $diagLog -Encoding utf8 -Append
+          } finally {
+            if (Test-Path $stdoutLog) {
+              Write-Host "=== Electron stdout ==="
+              Get-Content $stdoutLog
+            }
+            if (Test-Path $stderrLog) {
+              Write-Host "=== Electron stderr ==="
+              Get-Content $stderrLog
+            }
+            if (!$proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+            }
+          }
+
+      - name: Print Windows startup diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "::error title=Windows Electron startup failed::The install/startup verification failed. Diagnostic files are printed in this job log so artifact download is not required."
+
+          $paths = @(
+            $env:CAIRN_WINDOWS_LOG_DIR,
+            (Join-Path $env:RUNNER_TEMP "CairnInstall"),
+            (Join-Path $env:LOCALAPPDATA "Programs")
+          )
+
+          foreach ($path in $paths) {
+            Write-Host "::group::Tree: $path"
+            if (Test-Path $path) {
+              Get-ChildItem $path -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize |
+                Out-String -Width 240 |
+                Write-Host
+            } else {
+              Write-Host "Missing path: $path"
+            }
+            Write-Host "::endgroup::"
+          }
+
+          if (Test-Path $env:CAIRN_WINDOWS_LOG_DIR) {
+            Get-ChildItem $env:CAIRN_WINDOWS_LOG_DIR -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "::group::Diagnostic file: $($_.Name)"
+              Get-Content $_.FullName -Tail 250 -ErrorAction SilentlyContinue
+              Write-Host "::endgroup::"
+            }
+          }
+
+      - name: Upload Windows installer artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cairn-windows-installer-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            dist/*Setup*.exe
+            dist/*.blockmap
+            dist/latest.yml
+            ${{ env.CAIRN_WINDOWS_LOG_DIR }}/**
+
+      - name: Upload tag release artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*Setup*.exe
+            dist/*.blockmap
+            dist/latest.yml

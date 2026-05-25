@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 .playwright-cli/
 datas/
+node_modules/
+build/backend/
+build/pyinstaller/
+build/*.spec
+dist/
+release/
+*.spec

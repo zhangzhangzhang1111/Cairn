@@ -1,0 +1,79 @@
+{
+  "name": "cairn-desktop",
+  "version": "0.2.1",
+  "private": true,
+  "description": "Cross-platform Electron desktop shell for Cairn.",
+  "author": "leixiao <1729888211@qq.com>",
+  "main": "electron/main.js",
+  "scripts": {
+    "test:electron": "node --test --test-reporter=spec electron/tests/server-process.test.js electron/tests/release-config.test.js",
+    "start": "electron .",
+    "electron:dev": "electron .",
+    "package:backend": "uv run --project cairn --with pyinstaller pyinstaller --noconfirm --clean --onefile --name cairn-server --distpath build/backend --workpath build/pyinstaller --specpath build --paths cairn/src --collect-data cairn scripts/cairn_server_entry.py",
+    "dist": "npm run package:backend && electron-builder",
+    "dist:dir": "npm run package:backend && electron-builder --dir"
+  },
+  "build": {
+    "appId": "ai.cairn.desktop",
+    "productName": "Cairn",
+    "artifactName": "${productName}-Setup-${version}.${ext}",
+    "icon": "build/icon",
+    "asar": true,
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "dispatch.yaml",
+        "to": "dispatch.yaml"
+      },
+      {
+        "from": "dispatch_mock.yaml",
+        "to": "dispatch_mock.yaml"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "notarize": true,
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development"
+    }
+  },
+  "devDependencies": {
+    "electron": "^32.3.3",
+    "electron-builder": "^25.1.8"
+  }
+}
